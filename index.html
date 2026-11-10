@@ -369,7 +369,7 @@ window.Doybu = {
   state: {
     board: null, turn: 'w', selected: null, history: [],
     mode: 'online', playerColor: 'w', opponentId: null, busy: false, over: false,
-    lastMove: null, jumpPath: [], moveOrigin: null, capturedSet: new Set(),
+    lastMove: null, lastMoveTime: Date.now(), jumpPath: [], moveOrigin: null, capturedSet: new Set(),
     clocks: { w: 600, b: 600 }, timerInterval: null, heartbeatInterval: null,
     botDifficulty: 'medium', userProfile: {}, premove: null, chat: [], drawOffer: null
   },
@@ -497,7 +497,7 @@ window.Doybu = {
       if (data.board) this.state.board = data.board;
 
       if (data.status === 'playing' && data.lastSeen && data.playerWhite && data.playerBlack) {
-        if (Date.now() - data.lastSeen > 15000) {
+        if (Date.now() - data.lastSeen > 30000) { // Increased to 30s for safety
           db.collection('games').doc(gameId).update({ status: 'finished', winner: this.currentUser.uid, reason: 'disconnect' });
           return;
         }
@@ -514,6 +514,7 @@ window.Doybu = {
       }
 
       this.state.turn = data.turn || 'w';
+      this.state.lastMoveTime = data.lastMoveTime || Date.now(); // Sync server time
       this.state.lastMove = data.lastMove;
       this.state.history = data.history || [];
       this.state.clocks = data.clocks || { w: 600, b: 600 };
@@ -561,8 +562,23 @@ window.Doybu = {
     s.busy = true;
 
     if (s.mode === 'online') {
+      const originalBoard = cloneBoard(s.board);
+      const originalTurn = s.turn;
+      const originalHistory = [...s.history];
+
+      // Optimistic Update (makes UI feel instant)
+      s.board = applyMove(s.board, m);
+      s.turn = other(s.turn);
+      s.selected = null; s.moveOrigin = null; s.capturedSet = new Set(); s.jumpPath = [];
+      s.lastMove = { from: m.from, to: m.end };
+      s.history.push({ color: mover, from: m.from, to: m.end, notation: this.getNotation(m), time: 0 });
+      
+      this.onBoardUpdate(s);
+      this.onHistoryUpdate(s.history);
+
       try {
-        const token = await this.currentUser.getIdToken();
+        // Force token refresh to prevent getting stuck after 1 hour
+        const token = await this.currentUser.getIdToken(true); 
         const response = await fetch(WORKER_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -578,27 +594,28 @@ window.Doybu = {
         });
 
         const data = await response.json();
+        
         if (data.error) {
           toast("Server rejected move: " + data.error);
+          // Revert local board if server rejects
+          s.board = originalBoard;
+          s.turn = originalTurn;
+          s.history = originalHistory;
           s.selected = null; s.jumpPath = []; s.capturedSet = new Set();
-          s.busy = false;
           this.onBoardUpdate(s);
-          return;
+          this.onHistoryUpdate(s.history);
         }
         
-        s.board = applyMove(s.board, m);
-        s.turn = other(s.turn);
-        s.selected = null; s.moveOrigin = null; s.capturedSet = new Set(); s.jumpPath = [];
-        s.lastMove = { from: m.from, to: m.end };
-        s.history.push({ color: mover, from: m.from, to: m.end, notation: this.getNotation(m), time: 0 });
-        
-        this.onBoardUpdate(s);
-        this.onHistoryUpdate(s.history);
-        s.busy = false;
-
       } catch (err) {
         console.error("Server connection failed", err);
         toast("Connection error.");
+        s.board = originalBoard;
+        s.turn = originalTurn;
+        s.history = originalHistory;
+        s.selected = null; s.jumpPath = []; s.capturedSet = new Set();
+        this.onBoardUpdate(s);
+        this.onHistoryUpdate(s.history);
+      } finally {
         s.busy = false;
       }
     } else {
@@ -636,27 +653,22 @@ window.Doybu = {
             s.turn = other(s.turn);
             s.lastMove = { from: bm.from, to: bm.end };
             
-            // ==========================================
-            // MITTENS AI TRASH TALK INTEGRATION
-            // ==========================================
             if (s.botDifficulty === 'mittens') {
-              // Show typing indicator
               s.chat.push({ sender: 'mittens', text: "..." });
               this.onChatUpdate(s.chat);
 
               try {
-                // Call Cloudflare Worker to get Gemini's taunt
+                const token = await this.currentUser.getIdToken(true);
                 const response = await fetch(WORKER_URL, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     action: 'taunt',
-                    playerMove: this.getNotation(m) // Send the human's last move
+                    playerMove: this.getNotation(m)
                   })
                 });
                 const data = await response.json();
                 
-                // Replace the typing indicator with the real AI response
                 if (data.taunt) {
                     s.chat[s.chat.length - 1].text = data.taunt;
                 } else {
@@ -712,26 +724,40 @@ window.Doybu = {
   startTimer() {
     this.stopTimer();
     if (this.state.over) return;
+    
     this.state.timerInterval = setInterval(() => {
       if (this.state.over) return this.stopTimer();
       const active = this.state.turn;
       
-      if (active === this.state.playerColor || this.state.mode === 'bot') {
-          this.state.clocks[active] -= 1;
-          this.onTimerUpdate(this.state.clocks);
-
-          if (this.state.clocks[active] <= 0) {
-            this.state.over = true;
-            this.stopTimer();
-            const winner = this.state.opponentId;
-            if (this.state.mode === 'online') {
-              db.collection('games').doc(this.currentGameId).update({ status: 'finished', winner: winner });
-            } else {
+      if (this.state.mode === 'bot') {
+        if (active === this.state.playerColor) {
+            this.state.clocks[active] -= 1;
+            this.onTimerUpdate(this.state.clocks);
+            if (this.state.clocks[active] <= 0) {
+              this.state.over = true;
+              this.stopTimer();
               this.onGameOver(false, false);
             }
-          }
+        }
+      } else {
+        const elapsed = (Date.now() - this.state.lastMoveTime) / 1000;
+        const currentTime = Math.max(0, this.state.clocks[active] - elapsed);
+        
+        const displayClocks = { ...this.state.clocks };
+        displayClocks[active] = currentTime;
+        this.onTimerUpdate(displayClocks);
+
+        if (currentTime <= 0) {
+          this.state.over = true;
+          this.stopTimer();
+          
+          const isMeActive = (active === this.state.playerColor);
+          const winner = isMeActive ? this.state.opponentId : this.currentUser.uid;
+          
+          db.collection('games').doc(this.currentGameId).update({ status: 'finished', winner: winner, reason: 'timeout' });
+        }
       }
-    }, 1000);
+    }, 100);
   },
   stopTimer() {
     if (this.state.timerInterval) clearInterval(this.state.timerInterval);
@@ -1208,7 +1234,7 @@ window.Doybu = {
   };
 
   D.onTimerUpdate = function(clocks) {
-    const fmt = (s) => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+    const fmt = (s) => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
     const isW = D.state.playerColor === 'w';
     const myTime = isW ? clocks.w : clocks.b;
     const oppTime = isW ? clocks.b : clocks.w;
