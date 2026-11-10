@@ -2,12 +2,6 @@
 
 an online multiplayer checkers game that runs entirely in the browser.
 
-## play
-
-open `index.html` in any modern browser, or use the hosted copy on github pages.
-everything else (accounts, matchmaking, leaderboards) is handled by the services
-below; there is no build step and no server of your own to run.
-
 ## what is in here
 
 | file | purpose |
