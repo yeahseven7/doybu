@@ -370,7 +370,7 @@ window.Doybu = {
     board: null, turn: 'w', selected: null, history: [],
     mode: 'online', playerColor: 'w', opponentId: null, busy: false, over: false,
     lastMove: null, lastMoveTime: Date.now(), jumpPath: [], moveOrigin: null, capturedSet: new Set(),
-    clocks: { w: 600, b: 600 }, timerInterval: null, heartbeatInterval: null,
+    clocks: { w: 600, b: 600 }, timerInterval: null, heartbeatInterval: null, isMoving: false,
     botDifficulty: 'medium', userProfile: {}, premove: null, chat: [], drawOffer: null
   },
   currentUser: null,
@@ -426,6 +426,7 @@ window.Doybu = {
     this.state.over = false;
     this.state.history = [];
     this.state.clocks = { w: 600, b: 600 };
+    this.state.lastMoveTime = Date.now();
     this.state.selected = null; this.state.jumpPath = []; this.state.capturedSet = new Set();
     this.state.premove = null; 
     this.state.chat = [];
@@ -433,6 +434,7 @@ window.Doybu = {
       this.state.chat.push({ sender: 'mittens', text: "you dare challenge me? let's see what you've got." });
     }
     this.state.drawOffer = null;
+    this.state.isMoving = false;
     
     this.onStatusUpdate("Your turn vs Bot");
     this.onBoardUpdate(this.state);
@@ -484,6 +486,7 @@ window.Doybu = {
     this.state.over = false;
     this.state.selected = null; this.state.jumpPath = []; this.state.capturedSet = new Set();
     this.state.history = []; this.state.premove = null; this.state.drawOffer = null;
+    this.state.isMoving = false;
     
     this.state.board = initialBoard();
     this.onBoardUpdate(this.state);
@@ -494,10 +497,19 @@ window.Doybu = {
       const data = doc.data();
       if (!data) return;
 
+      // If we are currently making a move, ignore incoming old data
+      if (this.state.isMoving && (data.history || []).length <= (this.state.history || []).length) {
+        this.state.chat = data.chat || [];
+        this.state.drawOffer = data.drawOffer;
+        this.onChatUpdate(this.state.chat);
+        this.onDrawOffer(this.state.drawOffer);
+        return; 
+      }
+
       if (data.board) this.state.board = data.board;
 
       if (data.status === 'playing' && data.lastSeen && data.playerWhite && data.playerBlack) {
-        if (Date.now() - data.lastSeen > 30000) { // Increased to 30s for safety
+        if (Date.now() - data.lastSeen > 30000) { 
           db.collection('games').doc(gameId).update({ status: 'finished', winner: this.currentUser.uid, reason: 'disconnect' });
           return;
         }
@@ -514,7 +526,7 @@ window.Doybu = {
       }
 
       this.state.turn = data.turn || 'w';
-      this.state.lastMoveTime = data.lastMoveTime || Date.now(); // Sync server time
+      this.state.lastMoveTime = data.lastMoveTime || Date.now(); 
       this.state.lastMove = data.lastMove;
       this.state.history = data.history || [];
       this.state.clocks = data.clocks || { w: 600, b: 600 };
@@ -538,7 +550,9 @@ window.Doybu = {
         
         clearInterval(this.state.heartbeatInterval);
         this.state.heartbeatInterval = setInterval(() => {
-          db.collection('games').doc(gameId).update({ lastSeen: Date.now() });
+          if (!this.state.isMoving) {
+            db.collection('games').doc(gameId).update({ lastSeen: Date.now() });
+          }
         }, 5000);
       }
 
@@ -562,11 +576,12 @@ window.Doybu = {
     s.busy = true;
 
     if (s.mode === 'online') {
+      s.isMoving = true;
       const originalBoard = cloneBoard(s.board);
       const originalTurn = s.turn;
       const originalHistory = [...s.history];
 
-      // Optimistic Update (makes UI feel instant)
+      // Optimistic Update
       s.board = applyMove(s.board, m);
       s.turn = other(s.turn);
       s.selected = null; s.moveOrigin = null; s.capturedSet = new Set(); s.jumpPath = [];
@@ -577,7 +592,6 @@ window.Doybu = {
       this.onHistoryUpdate(s.history);
 
       try {
-        // Force token refresh to prevent getting stuck after 1 hour
         const token = await this.currentUser.getIdToken(true); 
         const response = await fetch(WORKER_URL, {
           method: 'POST',
@@ -597,7 +611,6 @@ window.Doybu = {
         
         if (data.error) {
           toast("Server rejected move: " + data.error);
-          // Revert local board if server rejects
           s.board = originalBoard;
           s.turn = originalTurn;
           s.history = originalHistory;
@@ -617,11 +630,17 @@ window.Doybu = {
         this.onHistoryUpdate(s.history);
       } finally {
         s.busy = false;
+        s.isMoving = false;
       }
     } else {
+      // BOT MODE TIMER FIX
+      const elapsed = (Date.now() - s.lastMoveTime) / 1000;
+      s.clocks[s.turn] = Math.max(0, s.clocks[s.turn] - elapsed);
+      
       s.history.push({ color: mover, from: m.from, to: m.end, notation: this.getNotation(m), time: 0 });
       s.board = applyMove(s.board, m);
       s.turn = other(s.turn);
+      s.lastMoveTime = Date.now(); // Bot's turn starts
       s.selected = null; s.moveOrigin = null; s.capturedSet = new Set(); s.jumpPath = [];
       s.lastMove = { from: m.from, to: m.end };
 
@@ -635,6 +654,10 @@ window.Doybu = {
 
       if (!s.over) {
         setTimeout(async () => {
+          // Bot thinking time deduction
+          const botElapsed = (Date.now() - s.lastMoveTime) / 1000;
+          s.clocks[s.turn] = Math.max(0, s.clocks[s.turn] - botElapsed);
+
           let bm;
           if (s.botDifficulty === 'mittens') {
             const moves = generateMoves(s.board, s.turn);
@@ -651,6 +674,7 @@ window.Doybu = {
             s.history.push({ color: s.turn, from: bm.from, to: bm.end, notation: this.getNotation(bm), time: 0 });
             s.board = applyMove(s.board, bm);
             s.turn = other(s.turn);
+            s.lastMoveTime = Date.now(); // Human's turn starts
             s.lastMove = { from: bm.from, to: bm.end };
             
             if (s.botDifficulty === 'mittens') {
@@ -731,9 +755,14 @@ window.Doybu = {
       
       if (this.state.mode === 'bot') {
         if (active === this.state.playerColor) {
-            this.state.clocks[active] -= 1;
-            this.onTimerUpdate(this.state.clocks);
-            if (this.state.clocks[active] <= 0) {
+            const elapsed = (Date.now() - this.state.lastMoveTime) / 1000;
+            const currentTime = Math.max(0, this.state.clocks[active] - elapsed);
+            
+            const displayClocks = { ...this.state.clocks };
+            displayClocks[active] = currentTime;
+            this.onTimerUpdate(displayClocks);
+            
+            if (currentTime <= 0) {
               this.state.over = true;
               this.stopTimer();
               this.onGameOver(false, false);
