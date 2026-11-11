@@ -205,6 +205,7 @@ const firebaseConfig = {
 const WORKER_URL = "https://doybu-matchmaking.erasyldawn321.workers.dev";
 
 firebase.initializeApp(firebaseConfig);
+firebase.firestore().settings({ experimentalForceLongPolling: true });
 const auth = firebase.auth();
 const db = firebase.firestore();
 
