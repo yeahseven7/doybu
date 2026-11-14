@@ -205,7 +205,6 @@ const firebaseConfig = {
 const WORKER_URL = "https://doybu-matchmaking.erasyldawn321.workers.dev";
 
 firebase.initializeApp(firebaseConfig);
-firebase.firestore().settings({ experimentalForceLongPolling: true });
 const auth = firebase.auth();
 const db = firebase.firestore();
 
@@ -498,12 +497,12 @@ window.Doybu = {
       const data = doc.data();
       if (!data) return;
 
-      // If we are currently making a move, ignore incoming old data
-      if (this.state.isMoving && (data.history || []).length <= (this.state.history || []).length) {
-        this.state.chat = data.chat || [];
-        this.state.drawOffer = data.drawOffer;
-        this.onChatUpdate(this.state.chat);
-        this.onDrawOffer(this.state.drawOffer);
+      // 🛑 THE FIX: Strict History Length Check
+      // Ignore delayed snapshots that have fewer moves than we currently have locally
+      const incomingHistory = data.history || [];
+      const localHistory = this.state.history || [];
+      
+      if (incomingHistory.length < localHistory.length) {
         return; 
       }
 
@@ -529,7 +528,7 @@ window.Doybu = {
       this.state.turn = data.turn || 'w';
       this.state.lastMoveTime = data.lastMoveTime || Date.now(); 
       this.state.lastMove = data.lastMove;
-      this.state.history = data.history || [];
+      this.state.history = incomingHistory;
       this.state.clocks = data.clocks || { w: 600, b: 600 };
       this.state.chat = data.chat || [];
       this.state.drawOffer = data.drawOffer;
@@ -551,7 +550,7 @@ window.Doybu = {
         
         clearInterval(this.state.heartbeatInterval);
         this.state.heartbeatInterval = setInterval(() => {
-          if (!this.state.isMoving) {
+          if (!this.state.busy) {
             db.collection('games').doc(gameId).update({ lastSeen: Date.now() });
           }
         }, 5000);
